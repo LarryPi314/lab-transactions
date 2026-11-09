@@ -1,9 +1,10 @@
 import sqlalchemy
+import psycopg2.errors
 from sqlalchemy.sql import text
 import os
 import logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.WARNING,
     format=f'%(asctime)s.%(msecs)03d - {os.getpid()} - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 )
@@ -87,34 +88,47 @@ class Ledger:
         2. This code uses f-strings instead of bind parameters.
             This can result in SQL injection vulnerabilities.
         '''
-        with self.connection.begin():
+        # retry the whole transaction if postgres aborts it because of a deadlock;
+        # the `with` block automatically rolls back the failed attempt
+        while True:
+            try:
+                with self.connection.begin():
 
-            # insert the transaction
-            sql = text(f'INSERT INTO transactions (debit_account_id, credit_account_id, amount) VALUES ({debit_account_id}, {credit_account_id}, {amount});')
-            logging.debug(sql)
-            self.connection.execute(sql)
-            self.connection.commit()
+                    # lock the balances table so no other transaction can read/write it concurrently
+                    # (task 4: replaced by row-level FOR UPDATE locks below)
+                    #sql = text('LOCK TABLE balances IN ACCESS EXCLUSIVE MODE;')
+                    #logging.debug(sql)
+                    #self.connection.execute(sql)
 
-            # update the debit account balance
-            sql = text(f'SELECT balance FROM balances WHERE account_id = {debit_account_id};')
-            logging.debug(sql)
-            results = self.connection.execute(sql)
-            debit_account_balance = results.first()[0]
+                    # insert the transaction
+                    sql = text(f'INSERT INTO transactions (debit_account_id, credit_account_id, amount) VALUES ({debit_account_id}, {credit_account_id}, {amount});')
+                    logging.debug(sql)
+                    self.connection.execute(sql)
 
-            debit_new_balance = debit_account_balance - amount
-            sql = text(f'UPDATE balances SET balance={debit_new_balance} WHERE account_id = {debit_account_id};')
-            logging.debug(sql)
-            self.connection.execute(sql)
-            self.connection.commit()
+                    # update the debit account balance
+                    sql = text(f'SELECT balance FROM balances WHERE account_id = {debit_account_id} FOR UPDATE;')
+                    logging.debug(sql)
+                    results = self.connection.execute(sql)
+                    debit_account_balance = results.first()[0]
 
-            # update the credit account balance
-            sql = text(f'SELECT balance FROM balances WHERE account_id = {credit_account_id};')
-            logging.debug(sql)
-            results = self.connection.execute(sql)
-            credit_account_balance = results.first()[0]
+                    debit_new_balance = debit_account_balance - amount
+                    sql = text(f'UPDATE balances SET balance={debit_new_balance} WHERE account_id = {debit_account_id};')
+                    logging.debug(sql)
+                    self.connection.execute(sql)
 
-            credit_new_balance = credit_account_balance + amount
-            sql = text(f'UPDATE balances SET balance={credit_new_balance} WHERE account_id = {credit_account_id};')
-            logging.debug(sql)
-            self.connection.execute(sql)
-            self.connection.commit()
+                    # update the credit account balance
+                    sql = text(f'SELECT balance FROM balances WHERE account_id = {credit_account_id} FOR UPDATE;')
+                    logging.debug(sql)
+                    results = self.connection.execute(sql)
+                    credit_account_balance = results.first()[0]
+
+                    credit_new_balance = credit_account_balance + amount
+                    sql = text(f'UPDATE balances SET balance={credit_new_balance} WHERE account_id = {credit_account_id};')
+                    logging.debug(sql)
+                    self.connection.execute(sql)
+                break
+            except sqlalchemy.exc.OperationalError as e:
+                if isinstance(e.orig, psycopg2.errors.DeadlockDetected):
+                    logging.warning('deadlock detected, retrying transfer')
+                    continue
+                raise
